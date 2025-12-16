@@ -278,122 +278,119 @@ export default function LeaderLinesOverlay({
   // }, [devices, rects, layers, byId]);
 const edges: EdgeRender[] = useMemo(() => {
   const claimedGlobalY: number[] = [];
-
-  // Fan-out index per SOURCE device
   const sourceFan = new Map<string, number>();
 
-  // Each TARGET owns a trunk:
-  // - trunkX: single approach x for all inbound edges (inJ.x)
-  // - busY: a shared horizontal “merge lane” y for this target
-  // - claimedEntryY: per-target entry slots so inbound lines don’t touch
-  const targetTrunks = new Map<
-    string,
-    { trunkX: number; busY: number; claimedEntryY: number[] }
-  >();
-
+  // Build column lefts so we can route in gaps
   const colLeftX = buildColumnLeftXs(rects, layers);
 
-  function getTargetTrunk(targetId: string, trunkX: number, desiredBusY: number) {
-    let t = targetTrunks.get(targetId);
-    if (!t) {
-      const busY = allocateLaneY(desiredBusY, claimedGlobalY);
-      t = { trunkX, busY, claimedEntryY: [] };
-      targetTrunks.set(targetId, t);
+  // Group edges by target first (so we can order fan-in cleanly)
+  const incomingByTarget = new Map<string, Array<{ fromId: string; toId: string }>>();
+  for (const fromDev of devices) {
+    for (const toId of fromDev.links || []) {
+      if (!incomingByTarget.has(toId)) incomingByTarget.set(toId, []);
+      incomingByTarget.get(toId)!.push({ fromId: fromDev.id, toId });
     }
-    return t;
+  }
+
+  // Target trunk registry:
+  // trunkX is in the LAST GAP before target column (not at inJ.x)
+  const targetTrunks = new Map<
+    string,
+    { trunkX: number; busY: number; entrySlots: number[] }
+  >();
+
+  function getTrunkX(fromCol: number, toCol: number, inJx: number) {
+    const gaps = gapXs(fromCol, toCol, colLeftX);
+    // If we have gaps, trunk lives in the LAST gap before target column.
+    // Otherwise fallback to inJ.x (adjacent or missing info).
+    return gaps.length ? gaps[gaps.length - 1] : inJx;
+  }
+
+  // Pass 1: allocate each target's trunk/bus once (busY near the *target* area)
+  for (const [toId, inc] of incomingByTarget) {
+    const toRect = rects.get(toId);
+    if (!toRect) continue;
+
+    // Use target center as the "bus gravity" so bus sits near the target, not midpoint of random sources
+    const tc = center(toRect);
+
+    // Claim one shared busY for this target (slight upward bias keeps things tighter)
+    const desiredBusY = tc.y - 20;
+    const busY = allocateLaneY(desiredBusY, claimedGlobalY);
+
+    // trunkX will be computed per-edge (depends on fromCol), but we store bus + entrySlots here
+    targetTrunks.set(toId, { trunkX: 0, busY, entrySlots: [] });
   }
 
   const out: EdgeRender[] = [];
 
-  for (const fromDev of devices) {
-    for (const toId of fromDev.links || []) {
-      const fromRect = rects.get(fromDev.id);
-      const toRect = rects.get(toId);
-      if (!fromRect || !toRect) continue;
+  // Now build paths; order inbound edges per target by source Y for cleaner bundling
+  for (const [toId, inc] of incomingByTarget) {
+    const toRect = rects.get(toId);
+    if (!toRect) continue;
+
+    const toC = center(toRect);
+
+    // Sort incoming by source Y so lanes don't criss-cross
+    const sorted = inc
+      .map(e => ({ ...e, fromRect: rects.get(e.fromId) }))
+      .filter(e => !!e.fromRect)
+      .sort((a, b) => center(a.fromRect!).y - center(b.fromRect!).y);
+
+    for (const { fromId } of sorted) {
+      const fromDev = devices.find(d => d.id === fromId);
+      if (!fromDev) continue;
+
+      const fromRect = rects.get(fromId);
+      if (!fromRect) continue;
 
       const fromC = center(fromRect);
-      const toC = center(toRect);
 
-      const fromCol = layers.get(fromDev.id) ?? 0;
+      const fromCol = layers.get(fromId) ?? 0;
       const toCol = layers.get(toId) ?? 0;
+      const span = Math.abs(toCol - fromCol);
 
       const outJ = outJunction(fromRect, toRect);
       const inJ = inJunction(fromRect, toRect);
 
+      // SOURCE fan-out
+      const sIdx = sourceFan.get(fromId) ?? 0;
+      sourceFan.set(fromId, sIdx + 1);
+      const sourceLaneY = allocateLaneY(outJ.y + sIdx * LANE_SPACING, claimedGlobalY);
+
+      // TARGET trunk/bus
+      const trunk = targetTrunks.get(toId)!;
+      const trunkX = getTrunkX(fromCol, toCol, inJ.x);
+
+      // store last computed trunkX (not strictly needed but nice to inspect)
+      trunk.trunkX = trunkX;
+
+      // Fan-in slots near target junction Y (per-target local slots, not global)
+      let entryY = inJ.y;
+      while (trunk.entrySlots.some(y => Math.abs(y - entryY) < LANE_SPACING)) entryY += LANE_SPACING;
+      trunk.entrySlots.push(entryY);
+
       const down = isDownEdge(fromDev, byId.get(toId));
-
-      // ---------------------------
-      // SOURCE FAN-OUT (unique lane per outgoing edge)
-      // ---------------------------
-      const sIdx = sourceFan.get(fromDev.id) ?? 0;
-      sourceFan.set(fromDev.id, sIdx + 1);
-
-      const sourceLaneDesired = outJ.y + sIdx * LANE_SPACING;
-      const sourceLaneY = allocateLaneY(sourceLaneDesired, claimedGlobalY);
-
-      // ---------------------------
-      // TARGET-OWNED TRUNK (shared for all inbound to this target)
-      // ---------------------------
-      // Choose a “desired bus Y” for this target (midpoint works well)
-      // (You can bias this later by column/target region if you want.)
-      const desiredBusY = (fromC.y + toC.y) / 2;
-
-      const trunk = getTargetTrunk(toId, inJ.x, desiredBusY);
-
-      // Per-edge entry slot near target so inbound lines don’t touch
-      const entryY = allocateLaneY(inJ.y, trunk.claimedEntryY);
-
-      // ---------------------------
-      // COLUMN GAP Xs for long spans (keep horizontals in empty space)
-      // ---------------------------
-      const gaps = gapXs(fromCol, toCol, colLeftX);
-      const span = Math.abs(toCol - fromCol);
-
-      // Use first/last gap x to make multi-elbow travel across columns
-      const x1 = gaps.length ? gaps[0] : trunk.trunkX;
-      const x2 = gaps.length ? gaps[gaps.length - 1] : trunk.trunkX;
-
-      // ---------------------------
-      // Same-row fast path (if adjacent-ish and aligned)
-      // ---------------------------
       const sameRow = Math.abs(fromC.y - toC.y) <= SAME_ROW_EPS;
 
       let pts: Point[];
 
+      // Same row + adjacent: keep straight-ish
       if (sameRow && span <= 1) {
-        // Straight-ish: outJ -> inJ horizontally, then into target
-        pts = [
-          fromC,
-          outJ,
-          { x: inJ.x, y: outJ.y },
-          inJ,
-          toC,
-        ];
-      } else if (span <= 1) {
-        // Adjacent columns: still use trunk bus to avoid inbound collisions
-        // center -> outJ -> sourceLane -> trunkX -> busY -> entryY -> inJ -> center
-        pts = [
-          fromC,
-          outJ,
-          { x: outJ.x, y: sourceLaneY },         // elbow 1 (fan-out)
-          { x: trunk.trunkX, y: sourceLaneY },   // elbow 2 (to trunk)
-          { x: trunk.trunkX, y: trunk.busY },    // elbow 3 (merge to bus)
-          { x: trunk.trunkX, y: entryY },        // elbow 4 (fan-in slot)
-          inJ,
-          toC,
-        ];
+        pts = [fromC, outJ, { x: inJ.x, y: outJ.y }, inJ, toC];
       } else {
-        // Long span: go to first gap, traverse to last gap, then approach trunk/bus
-        // center -> outJ -> sourceLane -> x1 -> x2 -> trunkX -> busY -> entryY -> inJ -> center
+        // Core shape (matches mock):
+        // center → outJ → fan-out → go to trunkX in gap → go to target busY → drop to entryY → short hop into target junction → center
+        //
+        // This keeps the “bundle” in the gap (not inside the target column), and reduces weird frames.
         pts = [
           fromC,
           outJ,
-          { x: outJ.x, y: sourceLaneY },         // elbow 1 (fan-out)
-          { x: x1, y: sourceLaneY },             // elbow 2 (into safe gap)
-          { x: x2, y: sourceLaneY },             // elbow 3 (across gaps)
-          { x: trunk.trunkX, y: sourceLaneY },   // elbow 4 (align to trunk)
-          { x: trunk.trunkX, y: trunk.busY },    // elbow 5 (merge)
-          { x: trunk.trunkX, y: entryY },        // elbow 6 (fan-in slot)
+          { x: outJ.x, y: sourceLaneY },        // elbow 1 (fan-out)
+          { x: trunkX, y: sourceLaneY },        // elbow 2 (into last gap)
+          { x: trunkX, y: trunk.busY },         // elbow 3 (merge to target bus)
+          { x: trunkX, y: entryY },             // elbow 4 (fan-in slot)
+          { x: inJ.x, y: entryY },              // short horizontal into target junction line
           inJ,
           toC,
         ];
@@ -401,11 +398,9 @@ const edges: EdgeRender[] = useMemo(() => {
 
       const path = pathFromPoints(pts);
 
-      // Icons:
-      // - icon1 at source junction
-      // - icon2 at the “merge” point on the target trunk (nice visual for down)
+      // Icons: source junction + merge point on bus (your “2nd elbow icon”)
       const icon1 = down ? outJ : undefined;
-      const icon2 = down ? { x: trunk.trunkX, y: trunk.busY } : undefined;
+      const icon2 = down ? { x: trunkX, y: trunk.busY } : undefined;
 
       out.push({ path, isDown: down, icon1, icon2 });
     }
