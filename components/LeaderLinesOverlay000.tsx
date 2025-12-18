@@ -4,6 +4,11 @@ import type { RawDevice } from "../types/types";
 import DownJunctionIcon from "./DownJunctionIcon";
 
 /* ──────────────────────────────────────────────
+   DEBUG TOGGLE
+────────────────────────────────────────────── */
+const DEBUG_ROUTING = true;
+
+/* ──────────────────────────────────────────────
    TYPES
 ────────────────────────────────────────────── */
 type Rect = { left: number; top: number; width: number; height: number };
@@ -37,13 +42,13 @@ const LANE_SPACING = 15;
 const TARGET_SEPARATION = 20;
 
 const STROKE_WIDTH = 2;
-const HIT_PAD = 2 + STROKE_WIDTH * 2; // geometry padding
+const HIT_PAD = 2 + STROKE_WIDTH * 2;
 
 const VERTICAL_LANE_SPACING = 12;
 const MAX_VERTICAL_LANES = 30;
 const MAX_LANE_SEARCH = 2500;
 
-const DIRECT_Y_EPS = 2; // “same row” threshold
+const DIRECT_Y_EPS = 2;
 
 const MIN_ELBOW_DELTA = 18;
 const STEP_OFFSET = 20;
@@ -76,7 +81,7 @@ function overlaps(a1: number, a2: number, b1: number, b2: number) {
 }
 
 /* ──────────────────────────────────────────────
-   BOX LIST (X-aware no-go)
+   BOX GEOMETRY (X-AWARE NO-GO)
 ────────────────────────────────────────────── */
 function buildBoxes(rects: Map<string, Rect>): Box[] {
   const boxes: Box[] = [];
@@ -97,15 +102,17 @@ function horizontalHitsAnyBox(
   x1: number,
   x2: number,
   boxes: Box[],
-  excludeIds: Set<string>
+  exclude: Set<string>
 ) {
   const a1 = Math.min(x1, x2);
   const a2 = Math.max(x1, x2);
-  for (const b of boxes) {
-    if (excludeIds.has(b.id)) continue;
-    if (y >= b.y1 && y <= b.y2 && overlaps(a1, a2, b.x1, b.x2)) return true;
-  }
-  return false;
+  return boxes.some(
+    b =>
+      !exclude.has(b.id) &&
+      y >= b.y1 &&
+      y <= b.y2 &&
+      overlaps(a1, a2, b.x1, b.x2)
+  );
 }
 
 function verticalHitsAnyBox(
@@ -113,35 +120,35 @@ function verticalHitsAnyBox(
   y1: number,
   y2: number,
   boxes: Box[],
-  excludeIds: Set<string>
+  exclude: Set<string>
 ) {
   const a1 = Math.min(y1, y2);
   const a2 = Math.max(y1, y2);
-  for (const b of boxes) {
-    if (excludeIds.has(b.id)) continue;
-    if (x >= b.x1 && x <= b.x2 && overlaps(a1, a2, b.y1, b.y2)) return true;
-  }
-  return false;
+  return boxes.some(
+    b =>
+      !exclude.has(b.id) &&
+      x >= b.x1 &&
+      x <= b.x2 &&
+      overlaps(a1, a2, b.y1, b.y2)
+  );
 }
 
 /* ──────────────────────────────────────────────
-   SEGMENT COLLISIONS (line-on-line)
+   LINE COLLISIONS
 ────────────────────────────────────────────── */
 function horizontalCollides(y: number, x1: number, x2: number, used: HorizontalSeg[]) {
   const a1 = Math.min(x1, x2);
   const a2 = Math.max(x1, x2);
-  return used.some(h =>
-    Math.abs(h.y - y) < STROKE_WIDTH * 2 &&
-    overlaps(a1, a2, h.x1, h.x2)
+  return used.some(
+    h => Math.abs(h.y - y) < STROKE_WIDTH * 2 && overlaps(a1, a2, h.x1, h.x2)
   );
 }
 
 function verticalCollides(x: number, y1: number, y2: number, used: VerticalLane[]) {
   const a1 = Math.min(y1, y2);
   const a2 = Math.max(y1, y2);
-  return used.some(v =>
-    Math.abs(v.x - x) < STROKE_WIDTH * 2 &&
-    overlaps(a1, a2, v.y1, v.y2)
+  return used.some(
+    v => Math.abs(v.x - x) < STROKE_WIDTH * 2 && overlaps(a1, a2, v.y1, v.y2)
   );
 }
 
@@ -149,89 +156,67 @@ function verticalCollides(x: number, y1: number, y2: number, used: VerticalLane[
    LANE HELPERS
 ────────────────────────────────────────────── */
 function getGapKey(a: number, b: number) {
-  const x = Math.min(a, b);
-  const y = Math.max(a, b);
-  return `${x}->${y}`;
+  return `${Math.min(a, b)}->${Math.max(a, b)}`;
 }
 
-/**
- * Choose a Y lane only when needed.
- * Blocks:
- * - line crosses boxes (X-aware)
- * - horizontal overlaps with other horizontal segments
- * - +20 separation for different targets (same toId can reuse)
- */
 function allocateSafeLaneY(
   desiredY: number,
   gapKey: string,
   toId: string,
-  claimedByGap: Map<string, { y: number; toId: string }[]>,
+  claimed: Map<string, { y: number; toId: string }[]>,
   boxes: Box[],
-  excludeIds: Set<string>,
-  outBaseX: number,
-  inBaseX: number,
-  usedHorizontals: HorizontalSeg[]
-): number {
-  const claimed = claimedByGap.get(gapKey) ?? [];
+  exclude: Set<string>,
+  outX: number,
+  inX: number,
+  usedHoriz: HorizontalSeg[]
+) {
+  const lanes = claimed.get(gapKey) ?? [];
 
   const blocked = (y: number) =>
-    horizontalHitsAnyBox(y, outBaseX, inBaseX, boxes, excludeIds) ||
-    horizontalCollides(y, outBaseX, inBaseX, usedHorizontals);
+    horizontalHitsAnyBox(y, outX, inX, boxes, exclude) ||
+    horizontalCollides(y, outX, inX, usedHoriz);
 
-  // fan-in reuse: only reuse lane if same target
-  for (const lane of claimed) {
-    if (lane.toId === toId && !blocked(lane.y)) return lane.y;
+  for (const l of lanes) {
+    if (l.toId === toId && !blocked(l.y)) return l.y;
   }
 
   let offset = 0;
-  while (offset <= MAX_LANE_SEARCH) {
-    const candidates = offset === 0 ? [desiredY] : [desiredY - offset, desiredY + offset];
-    for (const y of candidates) {
+  while (offset < MAX_LANE_SEARCH) {
+    for (const y of offset === 0 ? [desiredY] : [desiredY - offset, desiredY + offset]) {
       if (blocked(y)) continue;
 
-      const tooCloseToOtherTarget = claimed.some(
+      const tooClose = lanes.some(
         l => l.toId !== toId && Math.abs(l.y - y) < TARGET_SEPARATION
       );
-      if (tooCloseToOtherTarget) continue;
+      if (tooClose) continue;
 
-      claimed.push({ y, toId });
-      claimedByGap.set(gapKey, claimed);
+      lanes.push({ y, toId });
+      claimed.set(gapKey, lanes);
       return y;
     }
     offset += LANE_SPACING;
   }
 
-  // fallback
-  claimed.push({ y: desiredY, toId });
-  claimedByGap.set(gapKey, claimed);
+  lanes.push({ y: desiredY, toId });
+  claimed.set(gapKey, lanes);
   return desiredY;
 }
 
-/**
- * Allocate a vertical lane X in the gap so vertical legs don’t overlap,
- * and don’t pass through boxes (X-aware).
- *
- * IMPORTANT: called AFTER laneY is final.
- */
 function allocateVerticalLaneX(
   baseX: number,
   y1: number,
   y2: number,
   used: VerticalLane[],
   boxes: Box[],
-  excludeIds: Set<string>
-): number {
-  for (let lane = 0; lane < MAX_VERTICAL_LANES; lane++) {
-    const x = baseX + lane * VERTICAL_LANE_SPACING;
-
-    if (verticalHitsAnyBox(x, y1, y2, boxes, excludeIds)) continue;
+  exclude: Set<string>
+) {
+  for (let i = 0; i < MAX_VERTICAL_LANES; i++) {
+    const x = baseX + i * VERTICAL_LANE_SPACING;
+    if (verticalHitsAnyBox(x, y1, y2, boxes, exclude)) continue;
     if (verticalCollides(x, y1, y2, used)) continue;
-
     used.push({ x, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
     return x;
   }
-
-  // fallback
   used.push({ x: baseX, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
   return baseX;
 }
@@ -239,54 +224,33 @@ function allocateVerticalLaneX(
 /* ──────────────────────────────────────────────
    PATH BUILDERS
 ────────────────────────────────────────────── */
-function buildDirectPath(fromCenter: Point, outJ: Point, inJ: Point, toCenter: Point): string {
-  // Straight across gap at same Y (no lane, no elbows)
-  return `
-    M ${fromCenter.x} ${fromCenter.y}
-    L ${outJ.x} ${outJ.y}
-    L ${inJ.x} ${inJ.y}
-    L ${toCenter.x} ${toCenter.y}
-  `;
+function buildDirectPath(fc: Point, outJ: Point, inJ: Point, tc: Point) {
+  return `M ${fc.x} ${fc.y} L ${outJ.x} ${outJ.y} L ${inJ.x} ${inJ.y} L ${tc.x} ${tc.y}`;
 }
 
-function buildElbowPath(
-  fromCenter: Point,
-  outJ: Point,
-  laneY: number,
-  inJ: Point,
-  toCenter: Point
-): string {
-  // Suppress micro elbows: only step when there’s a meaningful Y move
+function buildElbowPath(fc: Point, outJ: Point, laneY: number, inJ: Point, tc: Point) {
   const dy = laneY - outJ.y;
   const needsStep =
-    Math.abs(dy) >= MIN_ELBOW_DELTA &&
-    Math.abs(outJ.x - inJ.x) > STROKE_WIDTH;
+    Math.abs(dy) >= MIN_ELBOW_DELTA && Math.abs(outJ.x - inJ.x) > STROKE_WIDTH;
 
-  const stepY = needsStep
-    ? outJ.y + Math.sign(dy || 1) * STEP_OFFSET
-    : laneY;
+  const stepY = needsStep ? outJ.y + Math.sign(dy || 1) * STEP_OFFSET : laneY;
 
   return needsStep
-    ? `
-      M ${fromCenter.x} ${fromCenter.y}
-      L ${outJ.x} ${outJ.y}
-      L ${outJ.x} ${stepY}
-      L ${inJ.x} ${stepY}
-      L ${inJ.x} ${laneY}
-      L ${inJ.x} ${inJ.y}
-      L ${toCenter.x} ${toCenter.y}
-    `
-    : `
-      M ${fromCenter.x} ${fromCenter.y}
-      L ${outJ.x} ${outJ.y}
-      L ${outJ.x} ${laneY}
-      L ${inJ.x} ${laneY}
-      L ${inJ.x} ${inJ.y}
-      L ${toCenter.x} ${toCenter.y}
-    `;
+    ? `M ${fc.x} ${fc.y}
+       L ${outJ.x} ${outJ.y}
+       L ${outJ.x} ${stepY}
+       L ${inJ.x} ${stepY}
+       L ${inJ.x} ${laneY}
+       L ${inJ.x} ${inJ.y}
+       L ${tc.x} ${tc.y}`
+    : `M ${fc.x} ${fc.y}
+       L ${outJ.x} ${outJ.y}
+       L ${outJ.x} ${laneY}
+       L ${inJ.x} ${laneY}
+       L ${inJ.x} ${inJ.y}
+       L ${tc.x} ${tc.y}`;
 }
 
-/* ────────────────────────────────────────────── */
 function connectionIsDown(from?: RawDevice, to?: RawDevice) {
   return from?.status === "down" || to?.status === "down";
 }
@@ -315,9 +279,7 @@ export default function LeaderLinesOverlay({
   const links = useMemo(() => {
     const out: { fromId: string; toId: string }[] = [];
     devices.forEach(d =>
-      d.links?.forEach(toId => {
-        if (deviceById.has(toId)) out.push({ fromId: d.id, toId });
-      })
+      d.links?.forEach(toId => deviceById.has(toId) && out.push({ fromId: d.id, toId }))
     );
     return out;
   }, [devices, deviceById]);
@@ -325,10 +287,8 @@ export default function LeaderLinesOverlay({
   const measure = () => {
     const container = document.getElementById(containerId);
     if (!container) return;
-
     const box = container.getBoundingClientRect();
     const next = new Map<string, Rect>();
-
     devices.forEach(d => {
       const el = document.getElementById(`node-${d.id}`);
       if (!el) return;
@@ -340,13 +300,11 @@ export default function LeaderLinesOverlay({
         height: r.height,
       });
     });
-
     setRects(next);
     setSize({ w: box.width, h: box.height });
   };
 
   useLayoutEffect(measure, [devices]);
-
   useEffect(() => {
     window.addEventListener("resize", measure);
     window.addEventListener("scroll", measure, true);
@@ -356,12 +314,20 @@ export default function LeaderLinesOverlay({
     };
   }, []);
 
-  const renderedEdges: Edge[] = useMemo(() => {
+  const renderedEdges = useMemo(() => {
     const boxes = buildBoxes(rects);
 
-    const claimedByGap = new Map<string, { y: number; toId: string }[]>();
-    const usedHorizontals: HorizontalSeg[] = [];
-    const usedVerticals: VerticalLane[] = [];
+    const claimed = new Map<string, { y: number; toId: string }[]>();
+    const usedHoriz: HorizontalSeg[] = [];
+    const usedVert: VerticalLane[] = [];
+
+    // DEBUG collectors
+    const debugBoxes: Box[] = [];
+    const debugLaneYs: number[] = [];
+    const debugVerticals: VerticalLane[] = [];
+    const debugBlockedDirects: { y: number; x1: number; x2: number }[] = [];
+
+    if (DEBUG_ROUTING) debugBoxes.push(...boxes);
 
     const out: Edge[] = [];
 
@@ -370,136 +336,123 @@ export default function LeaderLinesOverlay({
       const tr = rects.get(toId);
       if (!fr || !tr) continue;
 
-      const fromCenter = getCenter(fr);
-      const toCenter = getCenter(tr);
+      const fc = getCenter(fr);
+      const tc = getCenter(tr);
 
-      const rawOutJ = getOutJunction(fr, tr);
-      const rawInJ = getInJunction(fr, tr);
+      const rawOut = getOutJunction(fr, tr);
+      const rawIn = getInJunction(fr, tr);
 
       const fromCol = layers.get(fromId) ?? 0;
       const toCol = layers.get(toId) ?? 0;
       const gapKey = getGapKey(fromCol, toCol);
 
-      const excludeIds = new Set<string>([fromId, toId]);
+      const exclude = new Set<string>([fromId, toId]);
 
       const isDown = connectionIsDown(deviceById.get(fromId), deviceById.get(toId));
 
-      // ─────────────────────────────────────────
-      // (A) DIRECT PATH FAST-PATH
-      // Only if near-same Y and straight segment across gap is clear.
-      // This is what removes plcc/plcm pointless elbows.
-      // ─────────────────────────────────────────
-      const sameRow = Math.abs(fromCenter.y - toCenter.y) <= DIRECT_Y_EPS;
-      if (sameRow) {
-        const y = (fromCenter.y + toCenter.y) / 2;
-        const outJ = { ...rawOutJ, y };
-        const inJ = { ...rawInJ, y };
+      // ── DIRECT PATH FAST-PATH
+      if (Math.abs(fc.y - tc.y) <= DIRECT_Y_EPS) {
+        const y = (fc.y + tc.y) / 2;
+        const outJ = { ...rawOut, y };
+        const inJ = { ...rawIn, y };
 
-        const crossesBox = horizontalHitsAnyBox(y, outJ.x, inJ.x, boxes, excludeIds);
-        const crossesLine = horizontalCollides(y, outJ.x, inJ.x, usedHorizontals);
+        const blockedBox = horizontalHitsAnyBox(y, outJ.x, inJ.x, boxes, exclude);
+        const blockedLine = horizontalCollides(y, outJ.x, inJ.x, usedHoriz);
 
-        if (!crossesBox && !crossesLine) {
-          // reserve the horizontal so later edges don’t stack on it
-          usedHorizontals.push({
-            y,
-            x1: Math.min(outJ.x, inJ.x),
-            x2: Math.max(outJ.x, inJ.x),
-          });
-
+        if (!blockedBox && !blockedLine) {
+          usedHoriz.push({ y, x1: Math.min(outJ.x, inJ.x), x2: Math.max(outJ.x, inJ.x) });
           out.push({
             fromId,
             toId,
             isDown,
-            path: buildDirectPath(fromCenter, outJ, inJ, toCenter),
+            path: buildDirectPath(fc, outJ, inJ, tc),
             icon1: isDown ? outJ : undefined,
             icon2: isDown ? inJ : undefined,
           });
+          continue;
+        }
 
-          continue; // done for this edge
+        if (DEBUG_ROUTING) {
+          debugBlockedDirects.push({ y, x1: outJ.x, x2: inJ.x });
         }
       }
 
-      // ─────────────────────────────────────────
-      // (B) FALLBACK: LANE ROUTING (ONLY WHEN NEEDED)
-      // 1) pick laneY that avoids boxes + other horizontals
-      // 2) allocate vertical lane Xs using FINAL laneY
-      // 3) register segments
-      // ─────────────────────────────────────────
-      const desiredY = (fromCenter.y + toCenter.y) / 2;
+      // ── LANE ROUTING FALLBACK
+      const desiredY = (fc.y + tc.y) / 2;
 
       let laneY = allocateSafeLaneY(
         desiredY,
         gapKey,
         toId,
-        claimedByGap,
+        claimed,
         boxes,
-        excludeIds,
-        rawOutJ.x,
-        rawInJ.x,
-        usedHorizontals
+        exclude,
+        rawOut.x,
+        rawIn.x,
+        usedHoriz
       );
 
-      // Allocate vertical lanes AFTER final laneY (and X-aware box avoidance)
+      if (DEBUG_ROUTING) debugLaneYs.push(laneY);
+
       const outX = allocateVerticalLaneX(
-        rawOutJ.x,
-        rawOutJ.y,
+        rawOut.x,
+        rawOut.y,
         laneY,
-        usedVerticals,
+        usedVert,
         boxes,
-        excludeIds
+        exclude
       );
-
       const inX = allocateVerticalLaneX(
-        rawInJ.x,
-        rawInJ.y,
+        rawIn.x,
+        rawIn.y,
         laneY,
-        usedVerticals,
+        usedVert,
         boxes,
-        excludeIds
+        exclude
       );
 
-      const outJ = { ...rawOutJ, x: outX };
-      const inJ = { ...rawInJ, x: inX };
+      const outJ = { ...rawOut, x: outX };
+      const inJ = { ...rawIn, x: inX };
 
-      // If the horizontal at laneY is blocked by a box at the newly shifted Xs,
-      // nudge laneY until clear (this is rare, but fixes “lane through box” cases).
-      let guard = 0;
-      while (
-        guard < 200 &&
-        horizontalHitsAnyBox(laneY, outJ.x, inJ.x, boxes, excludeIds)
-      ) {
-        laneY += LANE_SPACING;
-        guard++;
-      }
-
-      // Reserve the horizontal segment at final laneY + X span
-      usedHorizontals.push({
+      usedHoriz.push({
         y: laneY,
         x1: Math.min(outJ.x, inJ.x),
         x2: Math.max(outJ.x, inJ.x),
       });
 
+      if (DEBUG_ROUTING) {
+        debugVerticals.push(
+          { x: outJ.x, y1: rawOut.y, y2: laneY },
+          { x: inJ.x, y1: rawIn.y, y2: laneY }
+        );
+      }
+
       out.push({
         fromId,
         toId,
         isDown,
-        path: buildElbowPath(fromCenter, outJ, laneY, inJ, toCenter),
+        path: buildElbowPath(fc, outJ, laneY, inJ, tc),
         icon1: isDown ? outJ : undefined,
         icon2: isDown ? { x: inJ.x, y: laneY } : undefined,
       });
     }
 
-    return out;
+    return {
+      edges: out,
+      debug: {
+        boxes: debugBoxes,
+        laneYs: debugLaneYs,
+        verticals: debugVerticals,
+        blocked: debugBlockedDirects,
+      },
+    };
   }, [links, rects, layers, deviceById]);
 
   return (
     <div id={containerId} style={{ position: "relative", width: "100%", height: "100%" }}>
-      <svg
-        width={size.w}
-        height={size.h}
-        style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
-      >
-        {renderedEdges.map((e, i) => (
+      {/* Main lines */}
+      <svg width={size.w} height={size.h} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+        {renderedEdges.edges.map((e, i) => (
           <path
             key={i}
             d={e.path}
@@ -512,7 +465,66 @@ export default function LeaderLinesOverlay({
         ))}
       </svg>
 
-      {renderedEdges.map(
+      {/* Debug overlay */}
+      {DEBUG_ROUTING && (
+        <svg
+          width={size.w}
+          height={size.h}
+          style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 10 }}
+        >
+          {renderedEdges.debug.boxes.map((b, i) => (
+            <rect
+              key={`box-${i}`}
+              x={b.x1}
+              y={b.y1}
+              width={b.x2 - b.x1}
+              height={b.y2 - b.y1}
+              fill="rgba(0,150,255,0.08)"
+              stroke="rgba(0,150,255,0.3)"
+              strokeDasharray="4 2"
+            />
+          ))}
+
+          {renderedEdges.debug.laneYs.map((y, i) => (
+            <line
+              key={`lane-${i}`}
+              x1={0}
+              x2={size.w}
+              y1={y}
+              y2={y}
+              stroke="rgba(255,200,0,0.6)"
+              strokeDasharray="6 4"
+            />
+          ))}
+
+          {renderedEdges.debug.verticals.map((v, i) => (
+            <line
+              key={`vert-${i}`}
+              x1={v.x}
+              x2={v.x}
+              y1={v.y1}
+              y2={v.y2}
+              stroke="rgba(200,0,255,0.6)"
+              strokeDasharray="2 2"
+            />
+          ))}
+
+          {renderedEdges.debug.blocked.map((d, i) => (
+            <line
+              key={`blocked-${i}`}
+              x1={d.x1}
+              x2={d.x2}
+              y1={d.y}
+              y2={d.y}
+              stroke="rgba(255,0,0,0.8)"
+              strokeDasharray="4 4"
+            />
+          ))}
+        </svg>
+      )}
+
+      {/* Down icons */}
+      {renderedEdges.edges.map(
         (e, i) =>
           e.isDown && (
             <React.Fragment key={`icons-${i}`}>
