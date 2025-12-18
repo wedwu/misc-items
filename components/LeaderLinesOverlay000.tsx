@@ -10,7 +10,7 @@ type Rect = { left: number; top: number; width: number; height: number };
 type Point = { x: number; y: number };
 type Interval = { top: number; bottom: number };
 
-type VerticalSeg = { x: number; y1: number; y2: number };
+type VerticalLane = { x: number; y1: number; y2: number };
 type HorizontalSeg = { y: number; x1: number; x2: number };
 
 type Edge = {
@@ -28,6 +28,7 @@ type Edge = {
 const JUNCTION_GAP = 15;
 const LANE_SPACING = 15;
 const TARGET_SEPARATION = 20;
+const VERTICAL_LANE_SPACING = 12;
 const STROKE_WIDTH = 2;
 const MIN_ELBOW_DELTA = 18;
 const STEP_OFFSET = 20;
@@ -56,7 +57,37 @@ function getInJunction(from: Rect, to: Rect): Point {
 }
 
 /* ──────────────────────────────────────────────
-   PATH BUILDER
+   VERTICAL LANE ALLOCATION (NEW)
+────────────────────────────────────────────── */
+function allocateVerticalLaneX(
+  baseX: number,
+  y1: number,
+  y2: number,
+  used: VerticalLane[]
+): number {
+  let lane = 0;
+
+  while (lane < 30) {
+    const x = baseX + lane * VERTICAL_LANE_SPACING;
+
+    const collides = used.some(v =>
+      Math.abs(v.x - x) < STROKE_WIDTH * 2 &&
+      Math.max(v.y1, y1) <= Math.min(v.y2, y2)
+    );
+
+    if (!collides) {
+      used.push({ x, y1, y2 });
+      return x;
+    }
+
+    lane++;
+  }
+
+  return baseX;
+}
+
+/* ──────────────────────────────────────────────
+   PATH BUILDER (ELBOW SUPPRESSED)
 ────────────────────────────────────────────── */
 function buildElbowPath(
   fromCenter: Point,
@@ -66,7 +97,11 @@ function buildElbowPath(
   toCenter: Point
 ): string {
   const dy = laneY - outJ.y;
-  const needsStep = Math.abs(dy) < MIN_ELBOW_DELTA;
+
+  const needsStep =
+    Math.abs(dy) < MIN_ELBOW_DELTA &&
+    Math.abs(outJ.x - inJ.x) > STROKE_WIDTH * 2;
+
   const stepY = needsStep
     ? outJ.y + Math.sign(dy || 1) * STEP_OFFSET
     : laneY;
@@ -125,18 +160,6 @@ function intersects(y: number, intervals: Interval[]) {
   return intervals.some(i => y >= i.top && y <= i.bottom);
 }
 
-function verticalCollides(
-  x: number,
-  y1: number,
-  y2: number,
-  used: VerticalSeg[]
-) {
-  return used.some(v =>
-    Math.abs(v.x - x) < STROKE_WIDTH * 2 &&
-    overlaps(y1, y2, v.y1, v.y2)
-  );
-}
-
 function horizontalCollides(
   y: number,
   x1: number,
@@ -150,7 +173,7 @@ function horizontalCollides(
 }
 
 /* ──────────────────────────────────────────────
-   LANE ALLOCATOR (FULLY SAFE)
+   LANE ALLOCATOR (Y-LANES)
 ────────────────────────────────────────────── */
 function allocateSafeLaneY(
   desiredY: number,
@@ -160,18 +183,13 @@ function allocateSafeLaneY(
   noGo: Interval[],
   outX: number,
   inX: number,
-  outY: number,
-  inY: number,
-  usedVerticals: VerticalSeg[],
   usedHorizontals: HorizontalSeg[]
 ): number {
   const claimed = claimedByGap.get(gapKey) ?? [];
 
   const blocked = (y: number) =>
     intersects(y, noGo) ||
-    horizontalCollides(y, outX, inX, usedHorizontals) ||
-    verticalCollides(outX, Math.min(outY, y), Math.max(outY, y), usedVerticals) ||
-    verticalCollides(inX, Math.min(inY, y), Math.max(inY, y), usedVerticals);
+    horizontalCollides(y, outX, inX, usedHorizontals);
 
   for (const lane of claimed) {
     if (lane.toId === toId && !blocked(lane.y)) return lane.y;
@@ -269,7 +287,7 @@ export default function LeaderLinesOverlay({
 
   const renderedEdges: Edge[] = useMemo(() => {
     const claimedByGap = new Map<string, { y: number; toId: string }[]>();
-    const usedVerticals: VerticalSeg[] = [];
+    const usedVerticals: VerticalLane[] = [];
     const usedHorizontals: HorizontalSeg[] = [];
     const out: Edge[] = [];
 
@@ -280,10 +298,29 @@ export default function LeaderLinesOverlay({
 
       const fromCenter = getCenter(fr);
       const toCenter = getCenter(tr);
-      const outJ = getOutJunction(fr, tr);
-      const inJ = getInJunction(fr, tr);
+
+      const rawOutJ = getOutJunction(fr, tr);
+      const rawInJ = getInJunction(fr, tr);
 
       const desiredY = (fromCenter.y + toCenter.y) / 2;
+
+      const outX = allocateVerticalLaneX(
+        rawOutJ.x,
+        Math.min(rawOutJ.y, desiredY),
+        Math.max(rawOutJ.y, desiredY),
+        usedVerticals
+      );
+
+      const inX = allocateVerticalLaneX(
+        rawInJ.x,
+        Math.min(rawInJ.y, desiredY),
+        Math.max(rawInJ.y, desiredY),
+        usedVerticals
+      );
+
+      const outJ = { ...rawOutJ, x: outX };
+      const inJ = { ...rawInJ, x: inX };
+
       const fromCol = layers.get(fromId) ?? 0;
       const toCol = layers.get(toId) ?? 0;
       const gapKey = `${Math.min(fromCol, toCol)}->${Math.max(fromCol, toCol)}`;
@@ -298,15 +335,7 @@ export default function LeaderLinesOverlay({
         noGo,
         outJ.x,
         inJ.x,
-        outJ.y,
-        inJ.y,
-        usedVerticals,
         usedHorizontals
-      );
-
-      usedVerticals.push(
-        { x: outJ.x, y1: Math.min(outJ.y, laneY), y2: Math.max(outJ.y, laneY) },
-        { x: inJ.x, y1: Math.min(inJ.y, laneY), y2: Math.max(inJ.y, laneY) }
       );
 
       usedHorizontals.push({
