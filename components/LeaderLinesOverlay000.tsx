@@ -1,12 +1,3 @@
-// -------------------------------------------------------------
-// LeaderLinesOverlay.tsx  (FULL CORRECTED DROP-IN FILE)
-// Fixes:
-// 1) Vertical lanes allocated AFTER final laneY (no more wrong ranges)
-// 2) No-go applied to vertical legs + horizontal lanes (no lines through boxes)
-// 3) Suppress most micro-elbows (plcc/plcm style “elbows for no reason”)
-// 4) Keep: per-gap grouping, +20px separation for different targets, no line overlaps
-// -------------------------------------------------------------
-
 import React, { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import computeLayers from "../layout/computeLayers";
 import type { RawDevice } from "../types/types";
@@ -17,10 +8,6 @@ import DownJunctionIcon from "./DownJunctionIcon";
 ────────────────────────────────────────────── */
 type Rect = { left: number; top: number; width: number; height: number };
 type Point = { x: number; y: number };
-type Interval = { top: number; bottom: number };
-
-type VerticalLane = { x: number; y1: number; y2: number };
-type HorizontalSeg = { y: number; x1: number; x2: number };
 
 type Edge = {
   fromId: string;
@@ -31,6 +18,17 @@ type Edge = {
   icon2?: Point;
 };
 
+type Box = {
+  id: string;
+  x1: number;
+  x2: number;
+  y1: number;
+  y2: number;
+};
+
+type HorizontalSeg = { y: number; x1: number; x2: number };
+type VerticalLane = { x: number; y1: number; y2: number };
+
 /* ──────────────────────────────────────────────
    CONSTANTS
 ────────────────────────────────────────────── */
@@ -39,13 +37,16 @@ const LANE_SPACING = 15;
 const TARGET_SEPARATION = 20;
 
 const STROKE_WIDTH = 2;
-
-const MIN_ELBOW_DELTA = 18;
-const STEP_OFFSET = 20;
+const HIT_PAD = 2 + STROKE_WIDTH * 2; // geometry padding
 
 const VERTICAL_LANE_SPACING = 12;
 const MAX_VERTICAL_LANES = 30;
 const MAX_LANE_SEARCH = 2500;
+
+const DIRECT_Y_EPS = 2; // “same row” threshold
+
+const MIN_ELBOW_DELTA = 18;
+const STEP_OFFSET = 20;
 
 /* ──────────────────────────────────────────────
    GEOMETRY HELPERS
@@ -75,43 +76,56 @@ function overlaps(a1: number, a2: number, b1: number, b2: number) {
 }
 
 /* ──────────────────────────────────────────────
-   NO-GO (BOX) INTERVALS
+   BOX LIST (X-aware no-go)
 ────────────────────────────────────────────── */
-function getNoGoIntervalsForSpan(
-  rects: Map<string, Rect>,
-  layers: Map<string, number>,
-  fromCol: number,
-  toCol: number
-): Interval[] {
-  const minCol = Math.min(fromCol, toCol);
-  const maxCol = Math.max(fromCol, toCol);
-
-  const intervals: Interval[] = [];
+function buildBoxes(rects: Map<string, Rect>): Box[] {
+  const boxes: Box[] = [];
   rects.forEach((r, id) => {
-    const col = layers.get(id);
-    if (col == null || col < minCol || col > maxCol) return;
-
-    intervals.push({
-      top: r.top - LANE_SPACING,
-      bottom: r.top + r.height + LANE_SPACING,
+    boxes.push({
+      id,
+      x1: r.left - HIT_PAD,
+      x2: r.left + r.width + HIT_PAD,
+      y1: r.top - HIT_PAD,
+      y2: r.top + r.height + HIT_PAD,
     });
   });
-
-  return intervals;
+  return boxes;
 }
 
-function intersectsY(y: number, intervals: Interval[]) {
-  return intervals.some(i => y >= i.top && y <= i.bottom);
+function horizontalHitsAnyBox(
+  y: number,
+  x1: number,
+  x2: number,
+  boxes: Box[],
+  excludeIds: Set<string>
+) {
+  const a1 = Math.min(x1, x2);
+  const a2 = Math.max(x1, x2);
+  for (const b of boxes) {
+    if (excludeIds.has(b.id)) continue;
+    if (y >= b.y1 && y <= b.y2 && overlaps(a1, a2, b.x1, b.x2)) return true;
+  }
+  return false;
 }
 
-function verticalIntersectsNoGo(y1: number, y2: number, noGo: Interval[]) {
+function verticalHitsAnyBox(
+  x: number,
+  y1: number,
+  y2: number,
+  boxes: Box[],
+  excludeIds: Set<string>
+) {
   const a1 = Math.min(y1, y2);
   const a2 = Math.max(y1, y2);
-  return noGo.some(i => Math.max(a1, i.top) <= Math.min(a2, i.bottom));
+  for (const b of boxes) {
+    if (excludeIds.has(b.id)) continue;
+    if (x >= b.x1 && x <= b.x2 && overlaps(a1, a2, b.y1, b.y2)) return true;
+  }
+  return false;
 }
 
 /* ──────────────────────────────────────────────
-   COLLISION CHECKS (SEGMENTS)
+   SEGMENT COLLISIONS (line-on-line)
 ────────────────────────────────────────────── */
 function horizontalCollides(y: number, x1: number, x2: number, used: HorizontalSeg[]) {
   const a1 = Math.min(x1, x2);
@@ -132,46 +146,7 @@ function verticalCollides(x: number, y1: number, y2: number, used: VerticalLane[
 }
 
 /* ──────────────────────────────────────────────
-   VERTICAL LANE ALLOCATION (FIXED)
-   - Must be called AFTER final laneY
-   - Must respect BOTH used verticals and no-go
-────────────────────────────────────────────── */
-function allocateVerticalLaneX(
-  baseX: number,
-  y1: number,
-  y2: number,
-  used: VerticalLane[],
-  noGo: Interval[]
-): number {
-  for (let lane = 0; lane < MAX_VERTICAL_LANES; lane++) {
-    const x = baseX + lane * VERTICAL_LANE_SPACING;
-
-    if (verticalIntersectsNoGo(y1, y2, noGo)) {
-      // Note: noGo is independent of x in this simplified model (columns are discrete),
-      // so if the vertical span intersects boxes, moving X doesn’t fix it.
-      // That’s intentional: it forces laneY to move instead of drawing through a box.
-      continue;
-    }
-
-    const collides = verticalCollides(x, y1, y2, used);
-    if (!collides) {
-      used.push({ x, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
-      return x;
-    }
-  }
-
-  // Fallback: if we ran out of lanes, return baseX (better than dropping the edge)
-  used.push({ x: baseX, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
-  return baseX;
-}
-
-/* ──────────────────────────────────────────────
-   LANE Y ALLOCATION
-   Guarantees:
-   - laneY not inside any box no-go
-   - horizontal lane segment doesn’t overlap other horizontal segments
-   - +20 separation if different toId (unless same toId)
-   - (vertical collisions handled by vertical lane allocation AFTER laneY)
+   LANE HELPERS
 ────────────────────────────────────────────── */
 function getGapKey(a: number, b: number) {
   const x = Math.min(a, b);
@@ -179,12 +154,20 @@ function getGapKey(a: number, b: number) {
   return `${x}->${y}`;
 }
 
+/**
+ * Choose a Y lane only when needed.
+ * Blocks:
+ * - line crosses boxes (X-aware)
+ * - horizontal overlaps with other horizontal segments
+ * - +20 separation for different targets (same toId can reuse)
+ */
 function allocateSafeLaneY(
   desiredY: number,
   gapKey: string,
   toId: string,
   claimedByGap: Map<string, { y: number; toId: string }[]>,
-  noGo: Interval[],
+  boxes: Box[],
+  excludeIds: Set<string>,
   outBaseX: number,
   inBaseX: number,
   usedHorizontals: HorizontalSeg[]
@@ -192,19 +175,17 @@ function allocateSafeLaneY(
   const claimed = claimedByGap.get(gapKey) ?? [];
 
   const blocked = (y: number) =>
-    intersectsY(y, noGo) ||
+    horizontalHitsAnyBox(y, outBaseX, inBaseX, boxes, excludeIds) ||
     horizontalCollides(y, outBaseX, inBaseX, usedHorizontals);
 
-  // Reuse only for same toId (fanin)
+  // fan-in reuse: only reuse lane if same target
   for (const lane of claimed) {
     if (lane.toId === toId && !blocked(lane.y)) return lane.y;
   }
 
-  // Search outward
   let offset = 0;
   while (offset <= MAX_LANE_SEARCH) {
     const candidates = offset === 0 ? [desiredY] : [desiredY - offset, desiredY + offset];
-
     for (const y of candidates) {
       if (blocked(y)) continue;
 
@@ -217,19 +198,57 @@ function allocateSafeLaneY(
       claimedByGap.set(gapKey, claimed);
       return y;
     }
-
     offset += LANE_SPACING;
   }
 
-  // Fallback
+  // fallback
   claimed.push({ y: desiredY, toId });
   claimedByGap.set(gapKey, claimed);
   return desiredY;
 }
 
+/**
+ * Allocate a vertical lane X in the gap so vertical legs don’t overlap,
+ * and don’t pass through boxes (X-aware).
+ *
+ * IMPORTANT: called AFTER laneY is final.
+ */
+function allocateVerticalLaneX(
+  baseX: number,
+  y1: number,
+  y2: number,
+  used: VerticalLane[],
+  boxes: Box[],
+  excludeIds: Set<string>
+): number {
+  for (let lane = 0; lane < MAX_VERTICAL_LANES; lane++) {
+    const x = baseX + lane * VERTICAL_LANE_SPACING;
+
+    if (verticalHitsAnyBox(x, y1, y2, boxes, excludeIds)) continue;
+    if (verticalCollides(x, y1, y2, used)) continue;
+
+    used.push({ x, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
+    return x;
+  }
+
+  // fallback
+  used.push({ x: baseX, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
+  return baseX;
+}
+
 /* ──────────────────────────────────────────────
-   PATH BUILDER (ELBOW SUPPRESSION FIXED)
+   PATH BUILDERS
 ────────────────────────────────────────────── */
+function buildDirectPath(fromCenter: Point, outJ: Point, inJ: Point, toCenter: Point): string {
+  // Straight across gap at same Y (no lane, no elbows)
+  return `
+    M ${fromCenter.x} ${fromCenter.y}
+    L ${outJ.x} ${outJ.y}
+    L ${inJ.x} ${inJ.y}
+    L ${toCenter.x} ${toCenter.y}
+  `;
+}
+
 function buildElbowPath(
   fromCenter: Point,
   outJ: Point,
@@ -237,10 +256,8 @@ function buildElbowPath(
   inJ: Point,
   toCenter: Point
 ): string {
-  // If the lane is essentially on the same Y as the junction, don’t add “step elbows”.
-  // Only step when there’s a real vertical move needed.
+  // Suppress micro elbows: only step when there’s a meaningful Y move
   const dy = laneY - outJ.y;
-
   const needsStep =
     Math.abs(dy) >= MIN_ELBOW_DELTA &&
     Math.abs(outJ.x - inJ.x) > STROKE_WIDTH;
@@ -340,13 +357,14 @@ export default function LeaderLinesOverlay({
   }, []);
 
   const renderedEdges: Edge[] = useMemo(() => {
+    const boxes = buildBoxes(rects);
+
     const claimedByGap = new Map<string, { y: number; toId: string }[]>();
     const usedHorizontals: HorizontalSeg[] = [];
     const usedVerticals: VerticalLane[] = [];
 
     const out: Edge[] = [];
 
-    // NOTE: ordering matters — edges later may need extra lanes.
     for (const { fromId, toId } of links) {
       const fr = rects.get(fromId);
       const tr = rects.get(toId);
@@ -358,45 +376,77 @@ export default function LeaderLinesOverlay({
       const rawOutJ = getOutJunction(fr, tr);
       const rawInJ = getInJunction(fr, tr);
 
-      const desiredY = (fromCenter.y + toCenter.y) / 2;
-
       const fromCol = layers.get(fromId) ?? 0;
       const toCol = layers.get(toId) ?? 0;
       const gapKey = getGapKey(fromCol, toCol);
 
-      const noGo = getNoGoIntervalsForSpan(rects, layers, fromCol, toCol);
+      const excludeIds = new Set<string>([fromId, toId]);
 
-      // 1) Choose laneY first (box + horizontal overlap safe)
+      const isDown = connectionIsDown(deviceById.get(fromId), deviceById.get(toId));
+
+      // ─────────────────────────────────────────
+      // (A) DIRECT PATH FAST-PATH
+      // Only if near-same Y and straight segment across gap is clear.
+      // This is what removes plcc/plcm pointless elbows.
+      // ─────────────────────────────────────────
+      const sameRow = Math.abs(fromCenter.y - toCenter.y) <= DIRECT_Y_EPS;
+      if (sameRow) {
+        const y = (fromCenter.y + toCenter.y) / 2;
+        const outJ = { ...rawOutJ, y };
+        const inJ = { ...rawInJ, y };
+
+        const crossesBox = horizontalHitsAnyBox(y, outJ.x, inJ.x, boxes, excludeIds);
+        const crossesLine = horizontalCollides(y, outJ.x, inJ.x, usedHorizontals);
+
+        if (!crossesBox && !crossesLine) {
+          // reserve the horizontal so later edges don’t stack on it
+          usedHorizontals.push({
+            y,
+            x1: Math.min(outJ.x, inJ.x),
+            x2: Math.max(outJ.x, inJ.x),
+          });
+
+          out.push({
+            fromId,
+            toId,
+            isDown,
+            path: buildDirectPath(fromCenter, outJ, inJ, toCenter),
+            icon1: isDown ? outJ : undefined,
+            icon2: isDown ? inJ : undefined,
+          });
+
+          continue; // done for this edge
+        }
+      }
+
+      // ─────────────────────────────────────────
+      // (B) FALLBACK: LANE ROUTING (ONLY WHEN NEEDED)
+      // 1) pick laneY that avoids boxes + other horizontals
+      // 2) allocate vertical lane Xs using FINAL laneY
+      // 3) register segments
+      // ─────────────────────────────────────────
+      const desiredY = (fromCenter.y + toCenter.y) / 2;
+
       let laneY = allocateSafeLaneY(
         desiredY,
         gapKey,
         toId,
         claimedByGap,
-        noGo,
+        boxes,
+        excludeIds,
         rawOutJ.x,
         rawInJ.x,
         usedHorizontals
       );
 
-      // 2) If vertical legs would cut through boxes, push laneY outward until clear.
-      //    This is what prevents “line through message server 3”.
-      let guard = 0;
-      while (
-        guard < 200 &&
-        (verticalIntersectsNoGo(rawOutJ.y, laneY, noGo) ||
-          verticalIntersectsNoGo(rawInJ.y, laneY, noGo))
-      ) {
-        laneY += LANE_SPACING;
-        guard++;
-      }
-
-      // 3) Now allocate vertical lanes using FINAL laneY span (FIX)
+      // Allocate vertical lanes AFTER final laneY (and X-aware box avoidance)
       const outX = allocateVerticalLaneX(
         rawOutJ.x,
         rawOutJ.y,
         laneY,
         usedVerticals,
-        noGo
+        boxes,
+        excludeIds
       );
 
       const inX = allocateVerticalLaneX(
@@ -404,23 +454,30 @@ export default function LeaderLinesOverlay({
         rawInJ.y,
         laneY,
         usedVerticals,
-        noGo
+        boxes,
+        excludeIds
       );
 
       const outJ = { ...rawOutJ, x: outX };
       const inJ = { ...rawInJ, x: inX };
 
-      // 4) Register the horizontal segment using final Xs
+      // If the horizontal at laneY is blocked by a box at the newly shifted Xs,
+      // nudge laneY until clear (this is rare, but fixes “lane through box” cases).
+      let guard = 0;
+      while (
+        guard < 200 &&
+        horizontalHitsAnyBox(laneY, outJ.x, inJ.x, boxes, excludeIds)
+      ) {
+        laneY += LANE_SPACING;
+        guard++;
+      }
+
+      // Reserve the horizontal segment at final laneY + X span
       usedHorizontals.push({
         y: laneY,
         x1: Math.min(outJ.x, inJ.x),
         x2: Math.max(outJ.x, inJ.x),
       });
-
-      const isDown = connectionIsDown(
-        deviceById.get(fromId),
-        deviceById.get(toId)
-      );
 
       out.push({
         fromId,
@@ -436,10 +493,7 @@ export default function LeaderLinesOverlay({
   }, [links, rects, layers, deviceById]);
 
   return (
-    <div
-      id={containerId}
-      style={{ position: "relative", width: "100%", height: "100%" }}
-    >
+    <div id={containerId} style={{ position: "relative", width: "100%", height: "100%" }}>
       <svg
         width={size.w}
         height={size.h}
@@ -462,8 +516,8 @@ export default function LeaderLinesOverlay({
         (e, i) =>
           e.isDown && (
             <React.Fragment key={`icons-${i}`}>
-              {e.icon1 && <DownJunctionIcon x={e.icon1.x} y={e.icon1.y} />}
-              {e.icon2 && <DownJunctionIcon x={e.icon2.x} y={e.icon2.y} />}
+              {e.icon1 && <DownIcon x={e.icon1.x} y={e.icon1.y} />}
+              {e.icon2 && <DownIcon x={e.icon2.x} y={e.icon2.y} />}
             </React.Fragment>
           )
       )}
