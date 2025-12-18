@@ -1,9 +1,4 @@
-import React, {
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useState,
-} from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import computeLayers from "../layout/computeLayers";
 import type { RawDevice } from "../types/types";
 import DownJunctionIcon from "./DownJunctionIcon";
@@ -14,6 +9,9 @@ import DownJunctionIcon from "./DownJunctionIcon";
 type Rect = { left: number; top: number; width: number; height: number };
 type Point = { x: number; y: number };
 type Interval = { top: number; bottom: number };
+
+type VerticalSeg = { x: number; y1: number; y2: number };
+type HorizontalSeg = { y: number; x1: number; x2: number };
 
 type Edge = {
   fromId: string;
@@ -29,12 +27,13 @@ type Edge = {
 ────────────────────────────────────────────── */
 const JUNCTION_GAP = 15;
 const LANE_SPACING = 15;
+const TARGET_SEPARATION = 20;
 const STROKE_WIDTH = 2;
 const MIN_ELBOW_DELTA = 18;
 const STEP_OFFSET = 20;
 
 /* ──────────────────────────────────────────────
-   GEOMETRY
+   GEOMETRY HELPERS
 ────────────────────────────────────────────── */
 function getCenter(r: Rect): Point {
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -68,36 +67,35 @@ function buildElbowPath(
 ): string {
   const dy = laneY - outJ.y;
   const needsStep = Math.abs(dy) < MIN_ELBOW_DELTA;
-
   const stepY = needsStep
     ? outJ.y + Math.sign(dy || 1) * STEP_OFFSET
     : laneY;
 
   return needsStep
     ? `
-        M ${fromCenter.x} ${fromCenter.y}
-        L ${outJ.x} ${outJ.y}
-        L ${outJ.x} ${stepY}
-        L ${inJ.x} ${stepY}
-        L ${inJ.x} ${laneY}
-        L ${inJ.x} ${inJ.y}
-        L ${toCenter.x} ${toCenter.y}
-      `
+      M ${fromCenter.x} ${fromCenter.y}
+      L ${outJ.x} ${outJ.y}
+      L ${outJ.x} ${stepY}
+      L ${inJ.x} ${stepY}
+      L ${inJ.x} ${laneY}
+      L ${inJ.x} ${inJ.y}
+      L ${toCenter.x} ${toCenter.y}
+    `
     : `
-        M ${fromCenter.x} ${fromCenter.y}
-        L ${outJ.x} ${outJ.y}
-        L ${outJ.x} ${laneY}
-        L ${inJ.x} ${laneY}
-        L ${inJ.x} ${inJ.y}
-        L ${toCenter.x} ${toCenter.y}
-      `;
+      M ${fromCenter.x} ${fromCenter.y}
+      L ${outJ.x} ${outJ.y}
+      L ${outJ.x} ${laneY}
+      L ${inJ.x} ${laneY}
+      L ${inJ.x} ${inJ.y}
+      L ${toCenter.x} ${toCenter.y}
+    `;
 }
 
 /* ──────────────────────────────────────────────
-   NO-GO ZONE LOGIC (NEW)
+   NO-GO + COLLISION HELPERS
 ────────────────────────────────────────────── */
-function getGapKey(a: number, b: number) {
-  return `${Math.min(a, b)}->${Math.max(a, b)}`;
+function overlaps(a1: number, a2: number, b1: number, b2: number) {
+  return Math.max(a1, b1) <= Math.min(a2, b2);
 }
 
 function getNoGoIntervals(
@@ -127,98 +125,79 @@ function intersects(y: number, intervals: Interval[]) {
   return intervals.some(i => y >= i.top && y <= i.bottom);
 }
 
-// Map<string, { y: number; toId: string }[]>
-// Map<string, number[]>,
+function verticalCollides(
+  x: number,
+  y1: number,
+  y2: number,
+  used: VerticalSeg[]
+) {
+  return used.some(v =>
+    Math.abs(v.x - x) < STROKE_WIDTH * 2 &&
+    overlaps(y1, y2, v.y1, v.y2)
+  );
+}
 
+function horizontalCollides(
+  y: number,
+  x1: number,
+  x2: number,
+  used: HorizontalSeg[]
+) {
+  return used.some(h =>
+    Math.abs(h.y - y) < STROKE_WIDTH * 2 &&
+    overlaps(x1, x2, h.x1, h.x2)
+  );
+}
+
+/* ──────────────────────────────────────────────
+   LANE ALLOCATOR (FULLY SAFE)
+────────────────────────────────────────────── */
 function allocateSafeLaneY(
   desiredY: number,
   gapKey: string,
   toId: string,
   claimedByGap: Map<string, { y: number; toId: string }[]>,
-  noGo: Interval[]
+  noGo: Interval[],
+  outX: number,
+  inX: number,
+  outY: number,
+  inY: number,
+  usedVerticals: VerticalSeg[],
+  usedHorizontals: HorizontalSeg[]
 ): number {
   const claimed = claimedByGap.get(gapKey) ?? [];
 
-  // 1️⃣ Reuse ONLY if same target AND no-go safe
+  const blocked = (y: number) =>
+    intersects(y, noGo) ||
+    horizontalCollides(y, outX, inX, usedHorizontals) ||
+    verticalCollides(outX, Math.min(outY, y), Math.max(outY, y), usedVerticals) ||
+    verticalCollides(inX, Math.min(inY, y), Math.max(inY, y), usedVerticals);
+
   for (const lane of claimed) {
-    if (lane.toId === toId && !intersects(lane.y, noGo)) {
-      return lane.y;
-    }
+    if (lane.toId === toId && !blocked(lane.y)) return lane.y;
   }
 
-  // 2️⃣ Search outward, enforcing +20px separation from other targets
   let offset = 0;
-
   while (offset < 2000) {
-    const candidates = [
-      desiredY - offset,
-      desiredY + offset,
-    ];
+    for (const y of [desiredY - offset, desiredY + offset]) {
+      if (blocked(y)) continue;
 
-    for (const y of candidates) {
-      if (intersects(y, noGo)) continue;
-
-      const tooCloseToOtherTarget = claimed.some(
-        l => l.toId !== toId && Math.abs(l.y - y) < 20
+      const tooClose = claimed.some(
+        l => l.toId !== toId && Math.abs(l.y - y) < TARGET_SEPARATION
       );
-
-      if (tooCloseToOtherTarget) continue;
+      if (tooClose) continue;
 
       claimed.push({ y, toId });
       claimedByGap.set(gapKey, claimed);
       return y;
     }
-
     offset += LANE_SPACING;
   }
 
-  // Fallback (should not hit)
   claimed.push({ y: desiredY, toId });
   claimedByGap.set(gapKey, claimed);
   return desiredY;
 }
-
-
-// function allocateSafeLaneY(
-//   desiredY: number,
-//   gapKey: string,
-//   claimedByGap: Map<string, { y: number; toId: string }[]>,
-//   noGo: Interval[]
-// ): number {
-//   const claimed = claimedByGap.get(gapKey) ?? [];
-
-//   // Try reuse first
-//   for (const y of claimed) {
-//     if (!intersects(y, noGo)) return y;
-//   }
-
-//   // Search outward
-//   let offset = 0;
-//   while (offset < 2000) {
-//     const up = desiredY - offset;
-//     const down = desiredY + offset;
-
-//     if (!intersects(up, noGo)) {
-//       claimed.push(up);
-//       claimedByGap.set(gapKey, claimed);
-//       return up;
-//     }
-
-//     if (!intersects(down, noGo)) {
-//       claimed.push(down);
-//       claimedByGap.set(gapKey, claimed);
-//       return down;
-//     }
-
-//     offset += LANE_SPACING;
-//   }
-
-//   claimed.push(desiredY);
-//   claimedByGap.set(gapKey, claimed);
-//   return desiredY;
-// }
-
-/* ────────────────────────────────────────────── */
 
 function connectionIsDown(from?: RawDevice, to?: RawDevice) {
   return from?.status === "down" || to?.status === "down";
@@ -279,7 +258,6 @@ export default function LeaderLinesOverlay({
   };
 
   useLayoutEffect(measure, [devices]);
-
   useEffect(() => {
     window.addEventListener("resize", measure);
     window.addEventListener("scroll", measure, true);
@@ -290,14 +268,9 @@ export default function LeaderLinesOverlay({
   }, []);
 
   const renderedEdges: Edge[] = useMemo(() => {
-    // const claimedByGap = new Map<string, number[]>();
-
-    const claimedByGap = new Map<
-      string,
-      { y: number; toId: string }[]
-    >();
-
-
+    const claimedByGap = new Map<string, { y: number; toId: string }[]>();
+    const usedVerticals: VerticalSeg[] = [];
+    const usedHorizontals: HorizontalSeg[] = [];
     const out: Edge[] = [];
 
     for (const { fromId, toId } of links) {
@@ -313,7 +286,7 @@ export default function LeaderLinesOverlay({
       const desiredY = (fromCenter.y + toCenter.y) / 2;
       const fromCol = layers.get(fromId) ?? 0;
       const toCol = layers.get(toId) ?? 0;
-      const gapKey = getGapKey(fromCol, toCol);
+      const gapKey = `${Math.min(fromCol, toCol)}->${Math.max(fromCol, toCol)}`;
 
       const noGo = getNoGoIntervals(rects, layers, fromCol, toCol);
 
@@ -322,8 +295,25 @@ export default function LeaderLinesOverlay({
         gapKey,
         toId,
         claimedByGap,
-        noGo
+        noGo,
+        outJ.x,
+        inJ.x,
+        outJ.y,
+        inJ.y,
+        usedVerticals,
+        usedHorizontals
       );
+
+      usedVerticals.push(
+        { x: outJ.x, y1: Math.min(outJ.y, laneY), y2: Math.max(outJ.y, laneY) },
+        { x: inJ.x, y1: Math.min(inJ.y, laneY), y2: Math.max(inJ.y, laneY) }
+      );
+
+      usedHorizontals.push({
+        y: laneY,
+        x1: Math.min(outJ.x, inJ.x),
+        x2: Math.max(outJ.x, inJ.x),
+      });
 
       const isDown = connectionIsDown(
         deviceById.get(fromId),
@@ -344,15 +334,8 @@ export default function LeaderLinesOverlay({
   }, [links, rects, layers, deviceById]);
 
   return (
-    <div
-      id={containerId}
-      style={{ position: "relative", width: "100%", height: "100%" }}
-    >
-      <svg
-        width={size.w}
-        height={size.h}
-        style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
-      >
+    <div id={containerId} style={{ position: "relative", width: "100%", height: "100%" }}>
+      <svg width={size.w} height={size.h} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
         {renderedEdges.map((e, i) => (
           <path
             key={i}
