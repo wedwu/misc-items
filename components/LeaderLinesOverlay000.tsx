@@ -127,44 +127,96 @@ function intersects(y: number, intervals: Interval[]) {
   return intervals.some(i => y >= i.top && y <= i.bottom);
 }
 
+// Map<string, { y: number; toId: string }[]>
+// Map<string, number[]>,
+
 function allocateSafeLaneY(
   desiredY: number,
   gapKey: string,
-  claimedByGap: Map<string, number[]>,
+  toId: string,
+  claimedByGap: Map<string, { y: number; toId: string }[]>,
   noGo: Interval[]
 ): number {
   const claimed = claimedByGap.get(gapKey) ?? [];
 
-  // Try reuse first
-  for (const y of claimed) {
-    if (!intersects(y, noGo)) return y;
+  // 1️⃣ Reuse ONLY if same target AND no-go safe
+  for (const lane of claimed) {
+    if (lane.toId === toId && !intersects(lane.y, noGo)) {
+      return lane.y;
+    }
   }
 
-  // Search outward
+  // 2️⃣ Search outward, enforcing +20px separation from other targets
   let offset = 0;
+
   while (offset < 2000) {
-    const up = desiredY - offset;
-    const down = desiredY + offset;
+    const candidates = [
+      desiredY - offset,
+      desiredY + offset,
+    ];
 
-    if (!intersects(up, noGo)) {
-      claimed.push(up);
-      claimedByGap.set(gapKey, claimed);
-      return up;
-    }
+    for (const y of candidates) {
+      if (intersects(y, noGo)) continue;
 
-    if (!intersects(down, noGo)) {
-      claimed.push(down);
+      const tooCloseToOtherTarget = claimed.some(
+        l => l.toId !== toId && Math.abs(l.y - y) < 20
+      );
+
+      if (tooCloseToOtherTarget) continue;
+
+      claimed.push({ y, toId });
       claimedByGap.set(gapKey, claimed);
-      return down;
+      return y;
     }
 
     offset += LANE_SPACING;
   }
 
-  claimed.push(desiredY);
+  // Fallback (should not hit)
+  claimed.push({ y: desiredY, toId });
   claimedByGap.set(gapKey, claimed);
   return desiredY;
 }
+
+
+// function allocateSafeLaneY(
+//   desiredY: number,
+//   gapKey: string,
+//   claimedByGap: Map<string, { y: number; toId: string }[]>,
+//   noGo: Interval[]
+// ): number {
+//   const claimed = claimedByGap.get(gapKey) ?? [];
+
+//   // Try reuse first
+//   for (const y of claimed) {
+//     if (!intersects(y, noGo)) return y;
+//   }
+
+//   // Search outward
+//   let offset = 0;
+//   while (offset < 2000) {
+//     const up = desiredY - offset;
+//     const down = desiredY + offset;
+
+//     if (!intersects(up, noGo)) {
+//       claimed.push(up);
+//       claimedByGap.set(gapKey, claimed);
+//       return up;
+//     }
+
+//     if (!intersects(down, noGo)) {
+//       claimed.push(down);
+//       claimedByGap.set(gapKey, claimed);
+//       return down;
+//     }
+
+//     offset += LANE_SPACING;
+//   }
+
+//   claimed.push(desiredY);
+//   claimedByGap.set(gapKey, claimed);
+//   return desiredY;
+// }
 
 /* ────────────────────────────────────────────── */
 
@@ -238,7 +290,14 @@ export default function LeaderLinesOverlay({
   }, []);
 
   const renderedEdges: Edge[] = useMemo(() => {
-    const claimedByGap = new Map<string, number[]>();
+    // const claimedByGap = new Map<string, number[]>();
+
+    const claimedByGap = new Map<
+      string,
+      { y: number; toId: string }[]
+    >();
+
+
     const out: Edge[] = [];
 
     for (const { fromId, toId } of links) {
@@ -261,6 +320,7 @@ export default function LeaderLinesOverlay({
       const laneY = allocateSafeLaneY(
         desiredY,
         gapKey,
+        toId,
         claimedByGap,
         noGo
       );
