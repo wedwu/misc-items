@@ -667,7 +667,6 @@ export default function LeaderLinesOverlay({
         (e, i) =>
           e.isDown && (
             <React.Fragment key={`icons-${i}`}>
-              {e.icon1 && <DownJunctionIcon x={e.icon1.x} y={e.icon1.y} />}
               {e.icon2 && <DownJunctionIcon x={e.icon2.x} y={e.icon2.y} />}
             </React.Fragment>
           )
