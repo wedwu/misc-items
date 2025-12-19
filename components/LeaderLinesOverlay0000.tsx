@@ -38,7 +38,7 @@ type LaneData = { y: number; toId: string; outX: number; inX: number };
 /* ──────────────────────────────────────────────
    CONSTANTS
 ────────────────────────────────────────────── */
-const JUNCTION_GAP = 25;
+const JUNCTION_GAP = 15;
 const LANE_SPACING = 15;
 const TARGET_SEPARATION = 20;
 
@@ -215,7 +215,7 @@ function allocateSafeLaneY(
     b => !exclude.has(b.id) && overlaps(minX, maxX, b.x1, b.x2)
   );
 
-  console.log(`      Allocating lane for ${toId}:`);
+  console.log(`   📦 Allocating lane for ${toId}:`);
   console.log(`      desiredY: ${desiredY.toFixed(1)}, outX: ${outX.toFixed(1)}, inX: ${inX.toFixed(1)}`);
   console.log(`      minX: ${minX.toFixed(1)}, maxX: ${maxX.toFixed(1)}`);
   console.log(`      relevantBoxes:`, relevantBoxes.length);
@@ -234,14 +234,14 @@ function allocateSafeLaneY(
   let startY = desiredY;
   if (relevantBoxes.some(b => desiredY >= b.y1 && desiredY <= b.y2 + VISUAL_CLEARANCE)) {
     startY = maxBoxBottom + VISUAL_CLEARANCE;
-    console.log(`       desiredY intersects or too close to boxes, moving to startY: ${startY.toFixed(1)}`);
+    console.log(`      ⚠️ desiredY intersects or too close to boxes, moving to startY: ${startY.toFixed(1)}`);
     
     // If we moved startY below boxes, just use it directly if not blocked
     if (!blocked(startY)) {
       const newLane = { y: startY, toId, outX, inX };
       lanes.push(newLane);
       claimed.set(gapKey, lanes);
-      console.log(`       Using startY directly: ${startY.toFixed(1)}`);
+      console.log(`      ✅ Using startY directly: ${startY.toFixed(1)}`);
       return newLane;
     }
   } else {
@@ -278,10 +278,11 @@ function allocateVerticalLaneX(
   y2: number,
   used: VerticalLane[],
   boxes: Box[],
-  exclude: Set<string>
+  exclude: Set<string>,
+  searchDirection: number = 1 // 1 for right, -1 for left
 ) {
   for (let i = 0; i < MAX_VERTICAL_LANES; i++) {
-    const x = baseX + i * VERTICAL_LANE_SPACING;
+    const x = baseX + (i * VERTICAL_LANE_SPACING * searchDirection);
     if (verticalHitsAnyBox(x, y1, y2, boxes, exclude)) continue;
     if (verticalCollides(x, y1, y2, used)) continue;
     used.push({ x, y1: Math.min(y1, y2), y2: Math.max(y1, y2) });
@@ -314,7 +315,7 @@ function buildElbowPath(fc: Point, outJ: Point, laneY: number, inJ: Point, tc: P
 }
 
 function connectionIsDown(from?: RawDevice, to?: RawDevice) {
-  return from?.status === "down" || to?.status === "down";
+  return to?.status === "down";
 }
 
 /* ──────────────────────────────────────────────
@@ -349,21 +350,21 @@ export default function LeaderLinesOverlay({
   const measure = () => {
     const container = document.getElementById(containerId);
     if (!container) {
-      console.log('X Container not found:', containerId);
+      console.log('❌ Container not found:', containerId);
       return;
     }
     const box = container.getBoundingClientRect();
-    console.log(' Container found:', containerId, box);
+    console.log('📦 Container found:', containerId, box);
     
     const next = new Map<string, Rect>();
     devices.forEach(d => {
       const el = document.getElementById(`node-${d.id}`);
       if (!el) {
-        console.log('X Node element not found:', `node-${d.id}`);
+        console.log('❌ Node element not found:', `node-${d.id}`);
         return;
       }
       const r = el.getBoundingClientRect();
-      console.log(' Found node:', d.id, r);
+      console.log('✅ Found node:', d.id, r);
       next.set(d.id, {
         left: r.left - box.left,
         top: r.top - box.top,
@@ -371,7 +372,7 @@ export default function LeaderLinesOverlay({
         height: r.height,
       });
     });
-    console.log(' Total rects measured:', next.size);
+    console.log('📊 Total rects measured:', next.size);
     setRects(next);
     setSize({ w: box.width, h: box.height });
   };
@@ -481,7 +482,7 @@ export default function LeaderLinesOverlay({
       const canReuseExisting = existingLane && 
         !horizontalHitsAnyBox(existingLane.y, rawOut.x, rawIn.x, boxes, exclude);
 
-      console.log(`   Routing ${fromId} → ${toId}:`);
+      console.log(`🔄 Routing ${fromId} → ${toId}:`);
       console.log(`   gapKey: ${gapKey}`);
       console.log(`   desiredY: ${desiredY.toFixed(1)}`);
       console.log(`   existingLane:`, existingLane);
@@ -501,7 +502,7 @@ export default function LeaderLinesOverlay({
         laneData = existingLane;
         outX = existingLane.outX;
         inX = existingLane.inX;
-        console.log(`    REUSING lane at y=${laneData.y.toFixed(1)}, outX=${outX.toFixed(1)}, inX=${inX.toFixed(1)}`);
+        console.log(`   ✅ REUSING lane at y=${laneData.y.toFixed(1)}, outX=${outX.toFixed(1)}, inX=${inX.toFixed(1)}`);
       } else {
         // Allocate new lane with vertical segments
         const newOutX = allocateVerticalLaneX(
@@ -510,7 +511,8 @@ export default function LeaderLinesOverlay({
           desiredY, // Use desiredY as placeholder for now
           usedVert,
           boxes,
-          exclude
+          exclude,
+          1 // Source side: search right (away from device)
         );
         const newInX = allocateVerticalLaneX(
           rawIn.x,
@@ -518,7 +520,8 @@ export default function LeaderLinesOverlay({
           desiredY,
           usedVert,
           boxes,
-          exclude
+          exclude,
+          -1 // Destination side: search left (toward source)
         );
         
         laneData = allocateSafeLaneY(
@@ -536,7 +539,7 @@ export default function LeaderLinesOverlay({
         outX = laneData.outX;
         inX = laneData.inX;
         
-        console.log(`    NEW lane at y=${laneData.y.toFixed(1)}, outX=${outX.toFixed(1)}, inX=${inX.toFixed(1)}`);
+        console.log(`   🆕 NEW lane at y=${laneData.y.toFixed(1)}, outX=${outX.toFixed(1)}, inX=${inX.toFixed(1)}`);
       }
 
       const laneY = laneData.y;
@@ -546,7 +549,7 @@ export default function LeaderLinesOverlay({
       const outJ = { ...rawOut, x: outX };
       const inJ = { ...rawIn, x: inX };
 
-      console.log(`     Final coordinates for ${fromId} → ${toId}:`);
+      console.log(`   🎯 Final coordinates for ${fromId} → ${toId}:`);
       console.log(`      laneY: ${laneY.toFixed(1)}`);
       console.log(`      outJ: x=${outJ.x.toFixed(1)}, y=${outJ.y.toFixed(1)}`);
       console.log(`      inJ: x=${inJ.x.toFixed(1)}, y=${inJ.y.toFixed(1)}`);
@@ -667,6 +670,7 @@ export default function LeaderLinesOverlay({
         (e, i) =>
           e.isDown && (
             <React.Fragment key={`icons-${i}`}>
+              {e.icon1 && <DownJunctionIcon x={e.icon1.x} y={e.icon1.y} />}
               {e.icon2 && <DownJunctionIcon x={e.icon2.x} y={e.icon2.y} />}
             </React.Fragment>
           )
