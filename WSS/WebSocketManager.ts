@@ -33,17 +33,17 @@ export class WebSocketManager {
       console.log('Connecting to WebSocket...');
       this.socket = new WebSocket(sockets.config, sockets.protocol);
 
-      this.socket.addEventListener('open', this.onOpen.bind(this));
-      this.socket.addEventListener('message', this.onMessage.bind(this));
-      this.socket.addEventListener('error', this.onError.bind(this));
-      this.socket.addEventListener('close', this.onClose.bind(this));
+      this.socket.addEventListener('open', this.handleOpen.bind(this));
+      this.socket.addEventListener('message', this.handleMessage.bind(this));
+      this.socket.addEventListener('error', this.handleError.bind(this));
+      this.socket.addEventListener('close', this.handleClose.bind(this));
     } catch (error) {
       console.error('Failed to create WebSocket:', error);
       this.handleReconnect();
     }
   }
 
-  private onOpen(event: Event): void {
+  private handleOpen(event: Event): void {
     console.log('WebSocket connected successfully');
     this.reconnectAttempts = 0;
     this.sendPreamble();
@@ -56,7 +56,7 @@ export class WebSocketManager {
     }
   }
 
-  private onMessage(event: MessageEvent): void {
+  private handleMessage(event: MessageEvent): void {
     try {
       const data = JSON.parse(event.data);
       console.log('Received message:', data);
@@ -77,11 +77,11 @@ export class WebSocketManager {
     console.log('Handshake completed:', data);
   }
 
-  private onError(event: Event): void {
+  private handleError(event: Event): void {
     console.error('WebSocket error:', event);
   }
 
-  private onClose(event: CloseEvent): void {
+  private handleClose(event: CloseEvent): void {
     console.log(`WebSocket closed: ${event.code} - ${event.reason}`);
     this.socket = null;
     this.handleReconnect();
@@ -121,7 +121,8 @@ export class WebSocketManager {
     return this.socket?.readyState ?? WebSocket.CLOSED;
   }
 
-  public onMessage(handler: (data: any) => void): () => void {
+  // Public method to register message handlers
+  public addMessageHandler(handler: (data: any) => void): () => void {
     this.messageHandlers.push(handler);
     // Return unsubscribe function
     return () => {
