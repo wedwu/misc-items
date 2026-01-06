@@ -1,15 +1,9 @@
 // WebSocketContext.tsx
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { Preamble } from './types';
-import { getClientId } from './client';
-import { sockets } from './websocket';
-
-class WebSocketManager {
-  // ... (same implementation as before)
-}
+import { WebSocketManager } from './WebSocketManager';
 
 interface WebSocketContextType {
-  wsManager: WebSocketManager | null;
+  wsManager: WebSocketManager;
   isConnected: boolean;
   send: (message: any) => void;
 }
@@ -21,11 +15,13 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
+    // Connect to WebSocket
     wsManager.connect();
 
     // Poll connection state
     const interval = setInterval(() => {
-      setIsConnected(wsManager.getConnectionState() === WebSocket.OPEN);
+      const state = wsManager.getConnectionState();
+      setIsConnected(state === WebSocket.OPEN);
     }, 1000);
 
     return () => {
